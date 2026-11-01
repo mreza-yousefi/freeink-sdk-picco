@@ -1,5 +1,7 @@
 #include "FrontlightManager.h"
 
+#include <cmath>
+
 #if FREEINK_CAP_FRONTLIGHT
 #include "FrontlightManager.h"
 
@@ -432,13 +434,35 @@ void FrontlightManager::applyPicco() {
   }
   if (!_i2cConfigured && !configurePicco()) return;
 
-  // Map SDK brightness% (1..100) -> LUT brightness index 2..9 (the monotonic ramp)
-  // and warmPercent (0..100) -> colorTemp index 0..9.
-  const uint8_t br = static_cast<uint8_t>(2 + (static_cast<uint16_t>(_brightness - 1) * 7 + 50) / 100);
-  const uint8_t ct = static_cast<uint8_t>((static_cast<uint16_t>(_warmPercent) * 9 + 50) / 100);
-  const uint8_t* e = &PICCO_FL_LUT[ct * 40 + br * 4];
-  const uint8_t coolPwm = e[0], warmPwm = e[1], coolCur = static_cast<uint8_t>(e[2] & 0x1f),
-                warmCur = static_cast<uint8_t>(e[3] & 0x1f);
+  // The vendor table is read 8 bytes (two entries) late: what looked like
+  // anomalous entries [*][0..1] are the two brightest steps of the previous
+  // colorTemp row. Realigned, every row is a clean 10-step ramp (cool/warm PWM
+  // rising ~20 per step, current 31 above the dimmest steps). Interpolate
+  // between steps on both axes so every 1% is a distinct, small change, with a
+  // gentle curve that spends more of the slider on the dim end, where steps
+  // are most visible. Never exceeds the vendor's brightest step.
+  const auto entry = [](int ct, int step, int field) -> float {
+    const int i = ct * 40 + step * 4 + 8;
+    if (i + 4 <= static_cast<int>(sizeof(PICCO_FL_LUT))) return PICCO_FL_LUT[i + field];
+    // Warmest row lacks its top two steps (they would sit past the table):
+    // continue its +20 warm ramp, capped at the table's brightest warm value.
+    static constexpr uint8_t warmTop[2] = {167, 184};
+    return field == 1 ? warmTop[step - 8] : field == 3 ? 31.0f : 0.0f;
+  };
+  const float b = static_cast<float>(_brightness - 1) / 99.0f;
+  const float bPos = 9.0f * b * sqrtf(b);  // b^1.5
+  const float cPos = 9.0f * static_cast<float>(_warmPercent) / 100.0f;
+  const int b0 = bPos >= 9.0f ? 8 : static_cast<int>(bPos);
+  const int c0 = cPos >= 9.0f ? 8 : static_cast<int>(cPos);
+  const float bf = bPos - static_cast<float>(b0);
+  const float cf = cPos - static_cast<float>(c0);
+  const auto lerp2 = [&](int field) -> uint8_t {
+    const float lo = entry(c0, b0, field) * (1.0f - bf) + entry(c0, b0 + 1, field) * bf;
+    const float hi = entry(c0 + 1, b0, field) * (1.0f - bf) + entry(c0 + 1, b0 + 1, field) * bf;
+    return static_cast<uint8_t>(lo * (1.0f - cf) + hi * cf + 0.5f);
+  };
+  const uint8_t coolPwm = lerp2(0), warmPwm = lerp2(1), coolCur = static_cast<uint8_t>(lerp2(2) & 0x1f),
+                warmCur = static_cast<uint8_t>(lerp2(3) & 0x1f);
 
   piccoUpdate(0x00, 0x80, 0x00);  // leave standby
   piccoWrite(0x03, coolPwm);      // cool brightness
