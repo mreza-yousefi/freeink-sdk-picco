@@ -432,7 +432,12 @@ void FrontlightManager::applyPicco() {
     _i2cConfigured = false;
     return;
   }
-  if (!_i2cConfigured && !configurePicco()) return;
+  const bool fromStandby = !_i2cConfigured;
+  // One retry: right after a reset the bus (shared with touch) can NAK the first write.
+  if (fromStandby && !configurePicco()) {
+    delay(5);
+    if (!configurePicco()) return;
+  }
 
   // The vendor table is read 8 bytes (two entries) late: what looked like
   // anomalous entries [*][0..1] are the two brightest steps of the previous
@@ -469,6 +474,9 @@ void FrontlightManager::applyPicco() {
   const uint8_t warmCur = warmPwm ? static_cast<uint8_t>(lerp2(3) & 0x1f) : 0;
 
   piccoUpdate(0x00, 0x80, 0x00);  // leave standby
+  // Levels written within ~3 ms of leaving standby are ignored (measured: the
+  // lamp toggle stayed dark until a later brightness write); give it time.
+  if (fromStandby) delay(10);
   piccoWrite(0x03, coolPwm);      // cool brightness
   piccoWrite(0x04, warmPwm);      // warm brightness
   piccoUpdate(0x05, 0x1f, coolCur);
