@@ -461,8 +461,12 @@ void FrontlightManager::applyPicco() {
     const float hi = entry(c0 + 1, b0, field) * (1.0f - bf) + entry(c0 + 1, b0 + 1, field) * bf;
     return static_cast<uint8_t>(lo * (1.0f - cf) + hi * cf + 0.5f);
   };
-  const uint8_t coolPwm = lerp2(0), warmPwm = lerp2(1), coolCur = static_cast<uint8_t>(lerp2(2) & 0x1f),
-                warmCur = static_cast<uint8_t>(lerp2(3) & 0x1f);
+  const uint8_t coolPwm = lerp2(0), warmPwm = lerp2(1);
+  // The vendor table never pairs PWM 0 with a non-zero current: the channel
+  // would stay enabled at PWM 0, which shows as a visible jump (warmth 95-99%
+  // and 1-5%). A channel whose PWM rounds to 0 is switched off, as in the table.
+  const uint8_t coolCur = coolPwm ? static_cast<uint8_t>(lerp2(2) & 0x1f) : 0;
+  const uint8_t warmCur = warmPwm ? static_cast<uint8_t>(lerp2(3) & 0x1f) : 0;
 
   piccoUpdate(0x00, 0x80, 0x00);  // leave standby
   piccoWrite(0x03, coolPwm);      // cool brightness
