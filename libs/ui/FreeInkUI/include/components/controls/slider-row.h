@@ -71,6 +71,9 @@ struct SliderRowProps {
   uint8_t capsuleRadius = RADIUS_INHERIT;
   int16_t stroke = 2;
   bool enabled = true;
+  // The trailing toggle stays usable when the row is disabled: it is often
+  // what turns the controlled thing (and so the row) back on.
+  bool toggleEnabled = true;
 };
 
 // Height the row needs for a control band of the given height (the caption
@@ -118,6 +121,7 @@ void sliderRow(Frame<MaxInteractions> &frame, Rect rect, const SliderRowProps &p
     toggleButton.iconAsset = props.toggleIconAsset;
     toggleButton.action = props.toggleAction;
     toggleButton.value = props.toggleValue;
+    toggleButton.enabled = props.toggleEnabled;
     button(frame, Rect{static_cast<int16_t>(bandRight - stepW), band.y, stepW, band.height}, toggleButton);
     bandRight = static_cast<int16_t>(bandRight - stepW - props.gap);
   }
