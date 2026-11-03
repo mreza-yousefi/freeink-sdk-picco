@@ -1,5 +1,10 @@
 # FreeInk SDK
 
+> **This is a fork** of the FreeInk SDK with BOOX Picco fixes on the `picco-custom` branch, used by
+> [crosspoint-reader-picco](https://github.com/mreza-yousefi/crosspoint-reader-picco). Upstream code is MIT; this
+> fork's changes are [PolyForm Noncommercial 1.0.0](LICENSE-FORK.md), free for noncommercial use. See
+> [NOTICE-FORK.md](NOTICE-FORK.md).
+
 [![Sponsor on Open Collective](https://img.shields.io/badge/sponsor-Open%20Collective-7FADF2?logo=opencollective&logoColor=white)](https://opencollective.com/freeink)
 
 A hardware-independent SDK for building e-paper reader firmware. FreeInk
