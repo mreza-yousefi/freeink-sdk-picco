@@ -1,5 +1,6 @@
 #include "FrontlightManager.h"
 
+#include <algorithm>
 #include <cmath>
 
 #if FREEINK_CAP_FRONTLIGHT
@@ -466,12 +467,17 @@ void FrontlightManager::applyPicco() {
     const float hi = entry(c0 + 1, b0, field) * (1.0f - bf) + entry(c0 + 1, b0 + 1, field) * bf;
     return static_cast<uint8_t>(lo * (1.0f - cf) + hi * cf + 0.5f);
   };
-  const uint8_t coolPwm = lerp2(0), warmPwm = lerp2(1);
-  // The vendor table never pairs PWM 0 with a non-zero current: the channel
-  // would stay enabled at PWM 0, which shows as a visible jump (warmth 95-99%
-  // and 1-5%). A channel whose PWM rounds to 0 is switched off, as in the table.
-  const uint8_t coolCur = coolPwm ? static_cast<uint8_t>(lerp2(2) & 0x1f) : 0;
-  const uint8_t warmCur = warmPwm ? static_cast<uint8_t>(lerp2(3) & 0x1f) : 0;
+  // A channel stays on, at least at PWM 1 / current 0, everywhere except at
+  // the warmth slider's ends: 0% is cool only, 100% warm only. Even that
+  // minimum is visible, so switching a channel off mid-slider (where the
+  // vendor rows reach 0) was a jump at every brightness (warmth 94->95% and
+  // 5->6%); the one step now sits at the ends (0% / 100%).
+  const bool coolOn = _warmPercent < 100;
+  const bool warmOn = _warmPercent > 0;
+  const uint8_t coolCur = coolOn ? static_cast<uint8_t>(lerp2(2) & 0x1f) : 0;
+  const uint8_t warmCur = warmOn ? static_cast<uint8_t>(lerp2(3) & 0x1f) : 0;
+  const uint8_t coolPwm = coolOn ? std::max<uint8_t>(lerp2(0), 1) : 0;
+  const uint8_t warmPwm = warmOn ? std::max<uint8_t>(lerp2(1), 1) : 0;
 
   piccoUpdate(0x00, 0x80, 0x00);  // leave standby
   // Levels written within ~3 ms of leaving standby are ignored (measured: the
