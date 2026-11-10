@@ -8,6 +8,9 @@
 #include <Wire.h>
 #include <I2cBusLock.h>
 #include <driver/gpio.h>
+#if FREEINK_TOUCH_TMA525C
+#include <Logging.h>
+#endif
 #if FREEINK_DEVICE_PICCO
 #include <driver/rtc_io.h>
 #endif
@@ -234,7 +237,7 @@ uint8_t InputManager::getState() {
     state |= (1 << (button2 + 4));
   }
 
-  // Read power button (polarity per board; X4 active-LOW, de-link active-HIGH)
+  // Read power button (polarity per board; X4 active-LOW, Silkscreen active-HIGH)
   const int powerActiveLevel = BoardConfig::ACTIVE.input.powerActiveHigh ? HIGH : LOW;
   if (digitalRead(BoardConfig::ACTIVE.input.power) == powerActiveLevel) {
     state |= (1 << BTN_POWER);
@@ -257,10 +260,14 @@ bool piccoWaitInt(int8_t irq, unsigned long timeoutMs);
 bool InputManager::prepareForDeepSleep() {
 #if FREEINK_DEVICE_EEGO_A4
   if (const auto& t = BoardConfig::ACTIVE.touch; t.controller == BoardConfig::TouchController::Gslx680) {
+    waitForTouchInit();  // a charger-only boot can sleep while the controller still boots
     const uint8_t halt = 0x88;
     const bool ok = gslWrite(0xE0, &halt, 1);
     delay(5);
-    Wire.end();
+    {
+      const freeink::I2cBusLock busLock;
+      Wire.end();
+    }
     if (t.sda >= 0) pinMode(t.sda, INPUT);
     if (t.scl >= 0) pinMode(t.scl, INPUT);
     if (t.reset >= 0) {
@@ -768,7 +775,12 @@ InputManager::TouchPoint InputManager::getTouchPoint() const { return touchPoint
 
 bool InputManager::supportsMultiTouch() const {
 #if FREEINK_CAP_TOUCH
-  return touchDataEnabled && BoardConfig::ACTIVE.touch.controller == BoardConfig::TouchController::Gt911;
+  if (!touchDataEnabled) return false;
+#if FREEINK_TOUCH_TMA525C
+  if (BoardConfig::ACTIVE.touch.controller == BoardConfig::TouchController::Tma525c) return piccoMaxContacts >= 2;
+#endif
+  const auto controller = BoardConfig::ACTIVE.touch.controller;
+  return controller == BoardConfig::TouchController::Gt911 || controller == BoardConfig::TouchController::Gslx680;
 #else
   return false;
 #endif
@@ -1644,7 +1656,10 @@ void InputManager::beginFt5x06() {
 #if FREEINK_DEVICE_PAPERMONO
   // The FT6336's power rail and reset line live on the M5IOE1 expander, not
   // ESP GPIOs — raise/release them before the probe below.
-  freeink::papermono::enableTouch();
+  [[maybe_unused]] const bool railUp = freeink::papermono::enableTouch();
+#ifdef TOUCH_PROBE_DEBUG
+  touchDebugPrintf("[touch] Paper Mono rail and reset: %s\n", railUp ? "up" : "FAILED");
+#endif
 #endif
 
   // The bus is shared with M5PM1/M5IOE1/RX8130, whose standing profile is
@@ -1905,6 +1920,7 @@ void InputManager::pollFt5x06(const unsigned long now) {
 
 #if FREEINK_TOUCH_GSLX680
 bool InputManager::gslWrite(const uint8_t reg, const uint8_t* data, const uint8_t len) {
+  const freeink::I2cBusLock busLock;
   const uint8_t addr = BoardConfig::ACTIVE.touch.i2cAddress;
   Wire.beginTransmission(addr);
   Wire.write(reg);
@@ -1913,6 +1929,7 @@ bool InputManager::gslWrite(const uint8_t reg, const uint8_t* data, const uint8_
 }
 
 bool InputManager::gslRead(const uint8_t reg, uint8_t* buf, const uint8_t len) {
+  const freeink::I2cBusLock busLock;
   const uint8_t addr = BoardConfig::ACTIVE.touch.i2cAddress;
   Wire.beginTransmission(addr);
   Wire.write(reg);
@@ -1955,11 +1972,45 @@ bool InputManager::gslUploadFirmware() {
 #endif
 }
 
+// The upload and the stock settle delays take ~0.85 s, which used to hold up
+// every boot and wake before anything reached the panel. The bus and its lock
+// come up here; the controller boots in a background task while setup carries
+// on, and touch reports nothing until it finishes. Every Wire user on this
+// shared bus takes freeink::I2cBusLock per transfer.
 void InputManager::beginGslx680() {
 #if FREEINK_DEVICE_EEGO_A4
   touchDataEnabled = false;
   const auto& t = BoardConfig::ACTIVE.touch;
   if (t.sda < 0 || t.scl < 0 || t.i2cAddress == 0) return;
+  freeink::enableI2cBusLock();
+  {
+    const freeink::I2cBusLock busLock;
+    Wire.begin(t.sda, t.scl, 400000);
+    Wire.setTimeOut(10);
+  }
+  gslInitRunning = true;
+  if (xTaskCreatePinnedToCore(&InputManager::gslInitTask, "gsl_init", 4096, this, 1, nullptr, 0) != pdPASS) {
+    gslInitBody();  // no task: boot it inline as before
+    gslInitRunning = false;
+  }
+#endif
+}
+
+void InputManager::gslInitTask(void* arg) {
+  auto* self = static_cast<InputManager*>(arg);
+  self->gslInitBody();
+  __atomic_store_n(&self->gslInitRunning, false, __ATOMIC_RELEASE);
+  vTaskDelete(nullptr);
+}
+
+void InputManager::waitForTouchInit() const {
+  // Bounded: the full sequence takes under a second.
+  for (int waited = 0; waited < 3000 && __atomic_load_n(&gslInitRunning, __ATOMIC_ACQUIRE); waited += 5) delay(5);
+}
+
+void InputManager::gslInitBody() {
+#if FREEINK_DEVICE_EEGO_A4
+  const auto& t = BoardConfig::ACTIVE.touch;
 
   // The GSLX680 has no reset self-timing: pulse RST low then high before I2C.
   if (t.reset >= 0) {
@@ -1971,8 +2022,6 @@ void InputManager::beginGslx680() {
     delay(50);
   }
 
-  Wire.begin(t.sda, t.scl, 400000);
-  Wire.setTimeOut(10);
 
   const uint8_t z4[4] = {0, 0, 0, 0};
   auto wr1 = [&](uint8_t reg, uint8_t v) { gslWrite(reg, &v, 1); };
@@ -2033,7 +2082,7 @@ void InputManager::beginGslx680() {
     startup();
     loaded = gslRead(0xB0, chk, 4) && chk[0] == 0x5A && chk[1] == 0x5A && chk[2] == 0x5A && chk[3] == 0x5A;
   }
-  touchDataEnabled = loaded;
+  __atomic_store_n(&touchDataEnabled, loaded, __ATOMIC_RELEASE);
   if (!loaded) LOG_ERR("INPUT", "GSLX680 firmware status check failed");
 #ifdef TOUCH_PROBE_DEBUG
   touchDebugPrintf("[touch] GSLX680 probe present=%d loaded=%d chk=%02X%02X%02X%02X\n", present, loaded, chk[0], chk[1],
@@ -2119,22 +2168,78 @@ void InputManager::pollGslx680(const unsigned long now) {
       touchReleasedEvent = true;
       lastTouchHeldDurationMs = now - touchDownPoint.timestamp;
     }
+    // Multi-touch release mirrors the GT911 contract: the authoritative
+    // zero-contact frame clears the snapshot and ends any gesture; a failed
+    // read above keeps the last complete frame instead.
+    touchSnapshot.count = 0;
+    touchSnapshot.reportedCount = 0;
+    touchSnapshot.idsStable = false;  // coordinate-only records (see below)
+    updateMultiTouchGesture(touchSnapshot, now);
     return;
   }
 
-  const uint16_t rawYWord = static_cast<uint16_t>(frame[5]) << 8 | frame[4];
-  const uint16_t rawXWord = static_cast<uint16_t>(frame[7]) << 8 | frame[6];
-
-  // Classified as the stock firmware does (the words' top nibble is the
-  // contact's track id, so only the 12-bit coordinates count):
+  // Classify every contact the way the stock firmware classifies its single
+  // contact (the words' top nibble is the contact's track id, so only the
+  // 12-bit coordinates count):
   //  - (0x3a0, 0x20) is the capacitive home key, ignored while a screen touch
   //    is in progress;
-  //  - any other sample at X >= 920 is past the glass and dropped, leaving all
-  //    touch and key state alone (clamped, it would land on the top edge);
+  //  - any other sample at X >= 920 is past the glass and dropped;
+  //  - an all-zero record is an absent contact: the fixed 24-byte read pads a
+  //    controller reporting fewer contacts;
   //  - an on-glass touch cancels a pending key press without firing it.
-  const uint16_t sampleX = rawXWord & 0x0fff;
-  if (sampleX == 0x03a0 && (rawYWord & 0x0fff) == 0x0020) {
-    if (touchPressed) return;
+  const auto& t = BoardConfig::ACTIVE.touch;
+  bool anyKey = false;
+  bool anyOnGlass = false;
+  for (uint8_t i = 0; i < count; ++i) {
+    const uint16_t x = (static_cast<uint16_t>(frame[7 + 4 * i]) << 8 | frame[6 + 4 * i]) & 0x0fff;
+    const uint16_t y = (static_cast<uint16_t>(frame[5 + 4 * i]) << 8 | frame[4 + 4 * i]) & 0x0fff;
+    if (x == 0x03a0 && y == 0x0020) anyKey = true;
+  }
+  uint8_t stored = 0;
+  uint8_t survived = 0;  // on-glass contacts past the storage cap still count
+  for (uint8_t i = 0; i < count; ++i) {
+    const uint16_t rawYWord = static_cast<uint16_t>(frame[5 + 4 * i]) << 8 | frame[4 + 4 * i];
+    const uint16_t rawXWord = static_cast<uint16_t>(frame[7 + 4 * i]) << 8 | frame[6 + 4 * i];
+    const uint16_t sampleX = rawXWord & 0x0fff;
+    const uint16_t sampleY = rawYWord & 0x0fff;
+    if (sampleX == 0x03a0 && sampleY == 0x0020) {
+      anyKey = true;
+      continue;
+    }
+    if (sampleX >= 920) continue;
+    if (sampleX == 0 && sampleY == 0) continue;
+    // A Home-pad report can carry a low-X phantom contact. Filter it only
+    // alongside the key sentinel: ordinary bottom-edge glass samples also
+    // have X < 64 after factory calibration (for example X=51 at y=720).
+    if (anyKey && sampleX < 64) continue;
+    ++survived;
+    if (stored < MAX_TOUCH_CONTACTS) {
+      // Stock factory calibration to portrait screen pixels, then into the
+      // panel-native frame (x = portrait y, y = 551 - portrait x). The
+      // profile's raw range can still trim the result.
+      int16_t screenX = 0;
+      int16_t screenY = 0;
+      gslCalibrate(sampleX, sampleY, screenX, screenY);
+      TouchPoint& point = touchSnapshot.points[stored].point;
+      point.valid = true;
+      point.x = mapTouchAxis(static_cast<uint16_t>(screenY), t.rawMinX, t.rawMaxX, t.rawMaxX - t.rawMinX);
+      point.y = mapTouchAxis(static_cast<uint16_t>(551 - screenX), t.rawMinY, t.rawMaxY, t.rawMaxY - t.rawMinY);
+      point.timestamp = now;
+      // Hardware-validated on the A4 LITE (2026-10-29): the record top nibble
+      // is always 0 on real glass — records are coordinate-only (no track
+      // ids). Ids are frame-local record slots; consumers must not retain
+      // them across frames (idsStable = false), mirroring GT911's
+      // coordinate-only contract.
+      touchSnapshot.points[stored].id = stored;
+      ++stored;
+    }
+    anyOnGlass = true;
+  }
+
+  if (anyOnGlass) {
+    touchHomeKeyDown = false;
+    touchHomeKeyLongFired = false;
+  } else if (anyKey && !touchPressed) {
     if (!touchHomeKeyDown) {
       touchHomeKeyEvent = true;
       touchHomeKeyDown = true;
@@ -2144,24 +2249,25 @@ void InputManager::pollGslx680(const unsigned long now) {
       touchHomeKeyLongEvent = true;
       touchHomeKeyLongFired = true;
     }
-    return;
+    return;  // key-only frame: touch and snapshot state stay as they are
+  } else {
+    return;  // only dropped contacts: keep the last complete frame
   }
-  if (sampleX >= 920) return;
-  touchHomeKeyDown = false;
-  touchHomeKeyLongFired = false;
 
-  // Stock factory calibration to portrait screen pixels, then into the
-  // panel-native frame (x = portrait y, y = 551 - portrait x). The profile's
-  // raw range can still trim the result.
-  int16_t screenX = 0;
-  int16_t screenY = 0;
-  gslCalibrate(sampleX, rawYWord & 0x0fff, screenX, screenY);
-  const auto& t = BoardConfig::ACTIVE.touch;
-  touchPoint.valid = true;
-  touchPoint.x = mapTouchAxis(static_cast<uint16_t>(screenY), t.rawMinX, t.rawMaxX, t.rawMaxX - t.rawMinX);
-  touchPoint.y = mapTouchAxis(static_cast<uint16_t>(551 - screenX), t.rawMinY, t.rawMaxY, t.rawMaxY - t.rawMinY);
-  touchPoint.timestamp = now;
+  // On-glass contacts: publish the snapshot, run the gesture state machine,
+  // and keep the single-touch API on the first contact — mirroring the GT911
+  // path, including that a multi-contact gesture must not become a
+  // primary-contact tap. reportedCount is the frame's surviving on-glass
+  // contact count (the raw controller count also carries key, past-glass and
+  // padding records), so dropped records neither block the gesture state
+  // machine nor suppress the single-touch tap; contacts past the storage cap
+  // still count, keeping truncation detectable.
+  touchSnapshot.reportedCount = survived;
+  touchSnapshot.idsStable = false;  // A4 records are coordinate-only (no track ids)
+  touchSnapshot.count = stored;
+  updateMultiTouchGesture(touchSnapshot, now);
 
+  touchPoint = touchSnapshot.points[0].point;
   if (!touchPressed) {
     touchPressed = true;
     touchPressedEvent = true;
@@ -2176,6 +2282,10 @@ void InputManager::pollGslx680(const unsigned long now) {
     if (absInt(dx) > TOUCH_TAP_SLOP_PX || absInt(dy) > TOUCH_TAP_SLOP_PX) touchMovedBeyondTapSlop = true;
     if (absInt(dx) > TOUCH_TAP_RELEASE_SLOP_PX || absInt(dy) > TOUCH_TAP_RELEASE_SLOP_PX)
       touchMovedBeyondTapReleaseSlop = true;
+  }
+  if (touchSnapshot.reportedCount > 1) {
+    touchMovedBeyondTapSlop = true;
+    touchMovedBeyondTapReleaseSlop = true;
   }
 }
 #endif  // FREEINK_TOUCH_GSLX680
@@ -2200,7 +2310,8 @@ constexpr unsigned long PICCO_TOUCH_STALE_MS = 3000;
 // One PIP report into buf (at most cap bytes); returns its length, 0 if none.
 uint16_t piccoReadReport(uint8_t addr, uint8_t* buf, uint16_t cap) {
   if (Wire.requestFrom(addr, static_cast<uint8_t>(2), static_cast<uint8_t>(true)) != 2) return 0;
-  const uint16_t len = Wire.read() | (Wire.read() << 8);
+  const uint8_t low = Wire.read();
+  const uint16_t len = low | (static_cast<uint16_t>(Wire.read()) << 8);
   if (len < 2 || len > cap) return 0;
   const uint8_t got = Wire.requestFrom(addr, static_cast<uint8_t>(len), static_cast<uint8_t>(true));
   for (uint8_t i = 0; i < got; ++i) buf[i] = Wire.read();
@@ -2228,6 +2339,7 @@ uint16_t piccoCrc(const uint8_t* p, size_t n) {
 }  // namespace
 
 void InputManager::beginTma525c() {
+  piccoMaxContacts = 1;
   const auto& t = BoardConfig::ACTIVE.touch;
   if (t.sda < 0 || t.scl < 0 || t.i2cAddress == 0) return;
 
@@ -2281,6 +2393,32 @@ void InputManager::beginTma525c() {
     mode = PICCO_MODE_APP;  // stock proceeds once the launch is acknowledged
   }
   touchDataEnabled = (mode == PICCO_MODE_APP);
+  if (touchDataEnabled) {
+    // PIP GET_SYSINFO (as documented by Linux cyttsp5): sensing data starts at
+    // byte 33; byte 50 is max_num_of_tch_per_refresh_cycle. Query the panel's
+    // configuration rather than assuming the controller family's finger limit.
+    static constexpr uint8_t sysinfo[] = {0x04, 0x00, 0x05, 0x00, 0x2F, 0x00, 0x02};
+    bool capabilityConfirmed = false;
+    Wire.beginTransmission(t.i2cAddress);
+    Wire.write(sysinfo, sizeof(sysinfo));
+    if (Wire.endTransmission() == 0) {
+      const unsigned long startedAt = millis();
+      for (uint8_t attempt = 0; attempt < 8; ++attempt) {
+        const unsigned long elapsed = millis() - startedAt;
+        if (elapsed >= 500 || !piccoWaitInt(t.irq, 500 - elapsed)) break;
+        const uint16_t len = piccoReadReport(t.i2cAddress, buf, sizeof(buf));
+        if (len >= 51 && buf[2] == 0x1F && (buf[4] & 0x7F) == 0x02 && buf[50] > 0 && buf[50] <= 31) {
+          piccoMaxContacts = buf[50];
+          capabilityConfirmed = true;
+          break;
+        }
+      }
+    }
+    if (!capabilityConfirmed)
+      LOG_ERR("INPUT", "Picco multi-touch capability query failed; keeping single touch");
+    else
+      LOG_INF("INPUT", "Picco touch reports up to %u contacts", piccoMaxContacts);
+  }
 #ifdef TOUCH_PROBE_DEBUG
   touchDebugPrintf("[touch] Picco TMA525C mode=0x%02X enabled=%d\r\n", mode, touchDataEnabled);
 #endif
@@ -2294,7 +2432,10 @@ void InputManager::pollTma525c(const unsigned long now) {
   // controller can go quiet while a finger rests still, so the hold-over is only
   // a long safety net for a missed lift-off (it must outlast a long press).
   if (t.irq >= 0 && digitalRead(t.irq) != LOW) {
-    if (touchPressed && now >= touchReleaseAt) {
+    if (touchPressed && now - touchPoint.timestamp >= PICCO_TOUCH_STALE_MS) {
+      cancelMultiTouchGesture();
+      touchSnapshot = {};
+      touchSnapshot.idsStable = true;
       touchReleasedEvent = true;
       lastTouchHeldDurationMs = now - touchDownPoint.timestamp;
       touchUpPoint = touchPoint;
@@ -2308,15 +2449,64 @@ void InputManager::pollTma525c(const unsigned long now) {
   const uint16_t len = piccoReadReport(t.i2cAddress, buf, sizeof(buf));
   if (len < 7 || buf[2] != PICCO_REPORT_TOUCH) return;
   const uint8_t count = buf[5] & 0x1F;
-  const uint8_t* rec = &buf[7];
-  const bool lifted = count == 0 || len < 17 || ((rec[1] >> 5) & 0x03) == 3;
-#ifdef TOUCH_PROBE_DEBUG
-  if (len >= 17)
-    touchDebugPrintf("[touch] Picco n=%u id=%u ev=%u x=%u y=%u\r\n", count, rec[1] & 0x1F, (rec[1] >> 5) & 0x03,
-                     rec[2] | (rec[3] << 8), rec[4] | (rec[5] << 8));
-#endif
+  constexpr uint8_t headerBytes = 7;
+  constexpr uint8_t recordBytes = 10;
+  if (count > MAX_TOUCH_CONTACTS || len < headerBytes + count * recordBytes) {
+    // Never reinterpret a truncated/malformed multi-contact frame as one finger
+    // or a release: either could turn an incomplete gesture into a UI action.
+    blockMultiTouchGesture();
+    touchSnapshot = {};
+    touchSnapshot.idsStable = true;
+    touchSnapshot.reportedCount = count;
+    LOG_ERR("INPUT", "Invalid Picco touch report: contacts=%u bytes=%u", count, len);
+    return;
+  }
 
-  if (lifted) {
+  // Bounded alongside the existing 128-byte report buffer; no heap allocation.
+  TouchSnapshot next{};
+  next.idsStable = true;
+  for (uint8_t i = 0; i < count; ++i) {
+    const uint8_t* rec = &buf[headerBytes + i * recordBytes];
+    if (((rec[1] >> 5) & 0x03) == 3) continue;  // explicit lift-off record
+    const uint8_t id = rec[1] & 0x1F;
+    const uint16_t x = static_cast<uint16_t>(rec[2]) | (static_cast<uint16_t>(rec[3]) << 8);
+    const uint16_t y = static_cast<uint16_t>(rec[4]) | (static_cast<uint16_t>(rec[5]) << 8);
+    bool duplicate = false;
+    for (uint8_t j = 0; j < next.count; ++j) duplicate |= next.points[j].id == id;
+    if (x > PICCO_TOUCH_W || y > PICCO_TOUCH_H || duplicate) {
+      blockMultiTouchGesture();
+      touchSnapshot = {};
+      touchSnapshot.idsStable = true;
+      touchSnapshot.reportedCount = count;
+      LOG_ERR("INPUT", "Invalid Picco contact: id=%u x=%u y=%u", id, x, y);
+      return;
+    }
+    const uint16_t px = PICCO_TOUCH_W - x;  // stock orientation
+    const uint16_t py = PICCO_TOUCH_H - y;
+    const uint16_t sx = t.swapXY ? py : px;
+    const uint16_t sy = t.swapXY ? px : py;
+    auto& contact = next.points[next.count++];
+    contact.id = id;
+    contact.point.valid = true;
+    contact.point.x = mapTouchAxis(sx, t.rawMinX, t.rawMaxX, t.rawMaxX - t.rawMinX);
+    contact.point.y = mapTouchAxis(sy, t.rawMinY, t.rawMaxY, t.rawMaxY - t.rawMinY);
+    if (t.flipX) contact.point.x = static_cast<uint16_t>((t.rawMaxX - t.rawMinX) - contact.point.x);
+    if (t.flipY) contact.point.y = static_cast<uint16_t>((t.rawMaxY - t.rawMinY) - contact.point.y);
+    contact.point.timestamp = now;
+  }
+  next.reportedCount = next.count;
+  // A lift and another finger's down can share a report with only one live
+  // contact. Do not let that new ID inherit the old finger's tap/swipe origin.
+  if (touchPressed && touchSnapshot.count == 1 && next.count == 1 && touchSnapshot.points[0].id != next.points[0].id) {
+    blockMultiTouchGesture();
+  }
+  touchSnapshot = next;
+  if (piccoMaxContacts >= 2)
+    updateMultiTouchGesture(touchSnapshot, now);
+  else if (next.count > 1)
+    blockMultiTouchGesture();
+
+  if (next.count == 0) {
     if (touchPressed) {
       touchReleasedEvent = true;
       lastTouchHeldDurationMs = now - touchDownPoint.timestamp;
@@ -2327,19 +2517,7 @@ void InputManager::pollTma525c(const unsigned long now) {
     return;
   }
 
-  const uint16_t x = static_cast<uint16_t>(rec[2] | (rec[3] << 8));
-  const uint16_t y = static_cast<uint16_t>(rec[4] | (rec[5] << 8));
-  if (x > PICCO_TOUCH_W || y > PICCO_TOUCH_H) return;
-  const uint16_t px = PICCO_TOUCH_W - x;  // stock orientation
-  const uint16_t py = PICCO_TOUCH_H - y;
-  const uint16_t sx = t.swapXY ? py : px;
-  const uint16_t sy = t.swapXY ? px : py;
-  touchPoint.valid = true;
-  touchPoint.x = mapTouchAxis(sx, t.rawMinX, t.rawMaxX, t.rawMaxX - t.rawMinX);
-  touchPoint.y = mapTouchAxis(sy, t.rawMinY, t.rawMaxY, t.rawMaxY - t.rawMinY);
-  if (t.flipX) touchPoint.x = static_cast<uint16_t>((t.rawMaxX - t.rawMinX) - touchPoint.x);
-  if (t.flipY) touchPoint.y = static_cast<uint16_t>((t.rawMaxY - t.rawMinY) - touchPoint.y);
-  touchPoint.timestamp = now;
+  touchPoint = next.points[0].point;
   if (!touchPressed) {
     touchPressedEvent = true;
     touchDownPoint = touchPoint;
@@ -2352,6 +2530,10 @@ void InputManager::pollTma525c(const unsigned long now) {
   if (absInt(dx) > TOUCH_TAP_SLOP_PX || absInt(dy) > TOUCH_TAP_SLOP_PX) touchMovedBeyondTapSlop = true;
   if (absInt(dx) > TOUCH_TAP_RELEASE_SLOP_PX || absInt(dy) > TOUCH_TAP_RELEASE_SLOP_PX)
     touchMovedBeyondTapReleaseSlop = true;
+  if (next.count > 1) {
+    touchMovedBeyondTapSlop = true;
+    touchMovedBeyondTapReleaseSlop = true;
+  }
   touchPressed = true;
   touchReleaseAt = now + PICCO_TOUCH_STALE_MS;
 }
