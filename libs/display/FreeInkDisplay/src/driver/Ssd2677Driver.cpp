@@ -185,9 +185,7 @@ void Ssd2677Driver::display(EpdBus& bus, const uint8_t* fb, const uint8_t* prev,
   // reason non-full frames ghosted). _old == nullptr (alloc failed) falls back to
   // an all-white old plane in sendPacked.
   sendPacked(bus, _old, fb);
-  // Stock powers off after every refresh (PON, 0x12, POF), whatever `turnOff` says.
-  (void)turnOff;
-  refreshWith(bus, mode == RefreshMode::Fast ? lut_picco_se0400_fast : lut_picco_se0400_full, true);
+  refreshWith(bus, mode == RefreshMode::Fast ? lut_picco_se0400_fast : lut_picco_se0400_full, turnOff);
   if (_old) memcpy(_old, fb, geometry().bufferSize);  // new becomes old for the next frame
   _needsInitialFull = false;
 }
@@ -334,7 +332,7 @@ void Ssd2677Driver::displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, co
     display(bus, fb, nullptr, RefreshMode::Full, turnOff);
     return;
   }
-  refreshWith(bus, lut_picco_se0400_gray, true);
+  refreshWith(bus, lut_picco_se0400_gray, turnOff);
   // NB: do NOT force the next frame to a full refresh here. Every reader page in
   // AA mode is a gray frame, so forcing a full on the following page flashed the
   // whole screen black on every page turn. The retained `_old` still holds the

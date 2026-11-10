@@ -172,7 +172,7 @@ int main(int argc, char** argv) {
     Bytes black(48000, 0x00), white(48000, 0xFF);
     s.display(bus, black.data(), nullptr, RefreshMode::Full, false);  // _old := black
     bus.clear();
-    s.display(bus, white.data(), nullptr, RefreshMode::Fast, false);  // old must = retained black
+    s.display(bus, white.data(), nullptr, RefreshMode::Fast, true);  // old must = retained black
     data = nullptr;
     for (const auto& w : bus.writes)
       if (w.command == 0x10) data = &w.bytes;
@@ -235,12 +235,14 @@ int main(int argc, char** argv) {
     for (const auto& w : bus.writes)
       if (w.command == 0x20) lut = &w.bytes;
     assert(*lut == Bytes(lut_picco_se0400_gray, lut_picco_se0400_gray + 535));
-    assert(lastRegister(bus, 0x02) == 0 && s._needsPowerOn);
+    // turnOff=false keeps the rails on between frames.
+    for (const auto& w : bus.writes) assert(w.command != 0x02);
+    assert(!s._needsPowerOn);
     const auto old = Bytes(s._old, s._old + 48000);
     bus.clear();
     fakeDelayMs = 0;
     s.powerOffBetweenFrames(bus);
-    assert(bus.writes.empty() && s._needsPowerOn && !s._needsInitialFull);
+    assert(lastRegister(bus, 0x02) == 0 && s._needsPowerOn && !s._needsInitialFull);
     assert(fakeDelayMs == 0 && old == Bytes(s._old, s._old + 48000));
     bus.clear();
     s.powerOffBetweenFrames(bus);
@@ -250,9 +252,20 @@ int main(int argc, char** argv) {
     for (const auto& w : bus.writes) {
       if (w.command == 0x04) poweredOn = true;
       if (w.command == 0x12) assert(poweredOn);
+      assert(w.command != 0x02);  // rails stay on
       assert(w.command != 0x07);  // no deep sleep
     }
-    assert(poweredOn && lastRegister(bus, 0x02) == 0 && s._needsPowerOn);
+    assert(poweredOn && !s._needsPowerOn);
+    // The next frame skips PON; turnOff=true powers off after the refresh.
+    bus.clear();
+    s.display(bus, white.data(), nullptr, RefreshMode::Fast, true);
+    for (const auto& w : bus.writes) assert(w.command != 0x04);
+    assert(lastRegister(bus, 0x02) == 0 && s._needsPowerOn);
+    // Deep sleep powers off first when the rails were left on.
+    s.display(bus, white.data(), nullptr, RefreshMode::Fast, false);
+    bus.clear();
+    s.deepSleep(bus);
+    assert(bus.writes.size() >= 2 && bus.writes[0].command == 0x02);
     s.deepSleep(bus);
     assert(lastRegister(bus, 0x07) == 0xA5);
     std::printf("Picco se0400: probe, init, packing and refresh passed\n");
