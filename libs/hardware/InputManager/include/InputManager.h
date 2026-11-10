@@ -34,6 +34,12 @@ class InputManager {
   // logical click/hold classification. False when the board has no such GPIO.
   bool isPowerButtonPhysicallyPressed() const;
 
+  // True while a digital button contact (any style but the ADC ladders) or the
+  // TMA525C touch INT (report pending) is asserted, read from the GPIOs now:
+  // no I2C, debounce or edge-state change. Lets a host notice input during long
+  // work between update() calls.
+  bool isDigitalInputPhysicallyActive(bool includeTouch = true) const;
+
   // Press edge since the previous update().
   bool wasPressed(uint8_t buttonIndex) const;
 

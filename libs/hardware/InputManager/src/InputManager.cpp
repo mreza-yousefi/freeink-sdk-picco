@@ -668,6 +668,24 @@ bool InputManager::isPowerButtonPhysicallyPressed() const {
   return digitalRead(pin) == activeLevel;
 }
 
+bool InputManager::isDigitalInputPhysicallyActive(const bool includeTouch) const {
+  const auto style = BoardConfig::ACTIVE.inputStyle;
+  if (style != BoardConfig::InputStyle::XteinkAdcLadder && style != BoardConfig::InputStyle::OnePageAdcLadder) {
+    // The hold styles leave their shared confirm pin out of getDigitalState().
+    if (getDigitalState() != 0 || isDigitalPressed(BoardConfig::ACTIVE.input.confirm)) return true;
+  }
+#if FREEINK_CAP_TOUCH && FREEINK_TOUCH_TMA525C
+  // Other controllers' INT idle level depends on their configuration; the TMA525C holds its
+  // active-low INT until the next poll reads the report.
+  const auto& t = BoardConfig::ACTIVE.touch;
+  if (includeTouch && touchDataEnabled && t.controller == BoardConfig::TouchController::Tma525c && t.irq >= 0 &&
+      digitalRead(t.irq) == LOW) {
+    return true;
+  }
+#endif
+  return false;
+}
+
 bool InputManager::wasPressed(const uint8_t buttonIndex) const { return pressedEvents & (1 << buttonIndex); }
 
 bool InputManager::wasAnyPressed() const { return pressedEvents > 0; }
