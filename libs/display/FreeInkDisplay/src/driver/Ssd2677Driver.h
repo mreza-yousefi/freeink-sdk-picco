@@ -75,6 +75,10 @@ class Ssd2677Driver : public PanelDriver {
   void copyGrayscaleMsb(EpdBus& bus, const uint8_t* msb) override;
   void displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, const unsigned char* lut, bool factoryMode) override;
   void cleanupGrayscaleBuffers(EpdBus& bus, const uint8_t* bw) override;
+  // Picco, after an overlay or text gray pass: a mode-3 refresh that drives only
+  // the rectangle, so the gray image around it keeps its levels. No restore.
+  bool displayRetainedGrayscaleOverlay(EpdBus& bus, const uint8_t* fb, uint16_t x, uint16_t y, uint16_t w,
+                                       uint16_t h) override;
 
  private:
   void initPanel(EpdBus& bus);

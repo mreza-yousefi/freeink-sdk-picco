@@ -468,8 +468,64 @@ void Ssd2677Driver::cleanupGrayscaleBuffers(EpdBus& bus, const uint8_t* bw) {
   if (_textAa.active()) display(bus, bw ? bw : _textAa.base(), nullptr, RefreshMode::Fast, true);
 }
 
+bool Ssd2677Driver::displayRetainedGrayscaleOverlay(EpdBus& bus, const uint8_t* fb, uint16_t x, uint16_t y,
+                                                    uint16_t w, uint16_t h) {
+  // Needs a finished overlay or text gray pass: _old holds its B/W base, _lsb
+  // flags its gray pixels. No restore: a B/W waveform cannot bring gray back.
+  if (isSticky() || !fb || !_grayPending || !_old || !_lsb || _textAa.active()) return false;
+  const PanelGeometry g = geometry();
+  if (!w || !h || x >= g.width || y >= g.height || w > g.width - x || h > g.height - y) return false;
+  _textAa.invalidate();
+  const uint16_t firstByte = x / 8, lastByte = (x + w - 1) / 8;
+  const auto rectMask = [&](uint16_t row, uint16_t xb) -> uint8_t {
+    if (row < y || row >= y + h || xb < firstByte || xb > lastByte) return 0;
+    uint8_t m = 0xFF;
+    if (xb == firstByte) m &= 0xFF >> (x % 8);
+    if (xb == lastByte) m &= static_cast<uint8_t>(0xFF << (7 - (x + w - 1) % 8));
+    return m;
+  };
+  // Mode 3 leaves codes 00 and 11 undriven, so pixels outside the rectangle go
+  // out with old == new and keep their gray. Inside, gray pixels start opposite
+  // their target so each one is driven; B/W pixels diff against the glass, as
+  // in a normal small update (display() also picks mode 3 for those).
+  bus.cmd(CMD_DATA);
+  {
+    auto txn = bus.beginTxn();
+    uint8_t chunk[128];
+    uint16_t n = 0;
+    for (uint16_t r = 0; r < g.height; ++r) {
+      for (uint16_t xb = 0; xb < g.widthBytes; ++xb) {
+        const uint32_t i = static_cast<uint32_t>(r) * g.widthBytes + xb;
+        const uint8_t m = rectMask(r, xb);
+        const auto from = static_cast<uint8_t>((_old[i] & ~_lsb[i]) | (~fb[i] & _lsb[i]));
+        const auto keep = static_cast<uint8_t>(_old[i] & ~m);
+        packPixels(static_cast<uint8_t>(keep | (from & m)), static_cast<uint8_t>(keep | (fb[i] & m)), &chunk[n]);
+        n += 2;
+        if (n == sizeof(chunk)) {
+          txn.writeBytes(chunk, n);
+          n = 0;
+        }
+      }
+    }
+    if (n) txn.writeBytes(chunk, n);
+  }
+  // No turn-off flag in this call: it runs during sleep, where the panel stays off.
+  refreshWith(bus, lut_picco_se0400_mode3, true);
+  // The rectangle is B/W now; the rest stays flagged for the next frame.
+  for (uint16_t r = y; r < y + h; ++r) {
+    for (uint16_t xb = firstByte; xb <= lastByte; ++xb) {
+      const uint32_t i = static_cast<uint32_t>(r) * g.widthBytes + xb;
+      const uint8_t m = rectMask(r, xb);
+      _old[i] = static_cast<uint8_t>((_old[i] & ~m) | (fb[i] & m));
+      _lsb[i] = static_cast<uint8_t>(_lsb[i] & ~m);
+    }
+  }
+  return true;
+}
+
 void Ssd2677Driver::deepSleep(EpdBus& bus) {
   _textAa.invalidate();
+  _grayPending = false;  // no strip over a sleeping controller; begin() re-inits anyway
   powerOffBetweenFrames(bus);
   // Stock (FUN_4200b608): 0x07 with the 0xA5 check code.
   bus.cmd(CMD_DEEP_SLEEP);

@@ -586,6 +586,132 @@ static void expectPackedPairs(Ssd2677Driver& driver) {
   }
 }
 
+// SE0400 sleep strip: a mode-3 refresh drives only the rectangle. Outside it
+// every pixel goes out as old == new (undriven), so the gray image keeps its
+// levels; inside it gray pixels start opposite their target.
+struct StripRect {
+  uint16_t x, y, w, h;
+  bool contains(size_t px) const {
+    const size_t row = px / 800, column = px % 800;
+    return row >= y && row < y + h && column >= x && column < x + w;
+  }
+};
+
+static int pixelBit(const uint8_t* plane, size_t px) { return (plane[px / 8] >> (7 - px % 8)) & 1; }
+
+// One strip over the glass model before it: B/W level `glass`, gray where `gray` is set.
+static void expectStrip2677(Ssd2677Driver& s, const StripRect& r, const Bytes& fb, const Bytes& glass,
+                            const Bytes& gray) {
+  EpdBus bus;
+  const bool wasOff = s._needsPowerOn;
+  assert(s.displayRetainedGrayscaleOverlay(bus, fb.data(), r.x, r.y, r.w, r.h));
+  std::vector<uint8_t> commands;
+  const Bytes* packed = nullptr;
+  for (const auto& w : bus.writes) {
+    commands.push_back(w.command);
+    if (w.command == 0x10) packed = &w.bytes;
+    if (w.command == 0x20) assert(w.bytes == Bytes(lut_picco_se0400_mode3, lut_picco_se0400_mode3 + 535));
+  }
+  // One refresh, powered off after it (sleep keeps the panel off).
+  const auto expected = wasOff ? std::vector<uint8_t>{0x10, 0x20, 0x04, 0x12, 0x02}
+                               : std::vector<uint8_t>{0x10, 0x20, 0x12, 0x02};
+  assert(commands == expected && s._needsPowerOn);
+  assert(packed && packed->size() == 96000);
+  for (size_t px = 0; px < 384000; ++px) {
+    const uint8_t pair = ((*packed)[px / 4] >> (6 - 2 * (px % 4))) & 3;
+    const bool inside = r.contains(px);
+    const int to = inside ? pixelBit(fb.data(), px) : pixelBit(glass.data(), px);
+    const int from = inside && pixelBit(gray.data(), px) ? !to : pixelBit(glass.data(), px);
+    assert(pair == ((from << 1) | to));
+  }
+  // The rectangle is B/W now: base = fb, gray flag clear; the rest unchanged.
+  for (size_t px = 0; px < 384000; ++px) {
+    const bool inside = r.contains(px);
+    assert(pixelBit(s._old, px) == (inside ? pixelBit(fb.data(), px) : pixelBit(glass.data(), px)));
+    assert(pixelBit(s._lsb, px) == (inside ? 0 : pixelBit(gray.data(), px)));
+  }
+  assert(s._grayPending);
+}
+
+// Mode 3 tables 1 and 4 (codes 00, 11): no drive level in any phase of any group.
+static void expectMode3HoldsUnchanged() {
+  for (unsigned table : {1u, 4u})
+    for (unsigned group = 0; group < 8; ++group)
+      for (unsigned half = 0; half < 2; ++half)
+        assert((lut_picco_se0400_mode3[7 + table * 88 + group * 11 + 1 + half] & 0x6F) == 0x6F);
+  assert(ssd2677LutDose(lut_picco_se0400_mode3, 1) == 0 && ssd2677LutDose(lut_picco_se0400_mode3, 4) == 0);
+}
+
+static void expectRetainedGrayStrip2677(Ssd2677Driver& s) {
+  expectMode3HoldsUnchanged();
+  const StripRect r{3, 2, 11, 3};
+  EpdBus bus;
+  Bytes white(48000, 0xFF), base(48000, 0xCC), fb(48000, 0xF0), lsb(48000, 0x00), msb(48000, 0x00);
+  lsb[200] = 0xF0;
+  msb[200] = msb[201] = 0xFF;
+  s.begin(bus);
+  assert(!s.displayRetainedGrayscaleOverlay(bus, fb.data(), r.x, r.y, r.w, r.h));
+  s.display(bus, base.data(), nullptr, RefreshMode::Full, false);
+  assert(!s.displayRetainedGrayscaleOverlay(bus, fb.data(), r.x, r.y, r.w, r.h));
+  const auto grayPass = [&] {
+    s.display(bus, base.data(), nullptr, RefreshMode::Full, false);
+    s.beginGrayscale(bus, base.data(), GrayscaleMode::Overlay, RefreshMode::Fast, false);
+    s.copyGrayscaleLsb(bus, lsb.data());
+    s.copyGrayscaleMsb(bus, msb.data());
+    s.displayGray(bus, base.data(), false, nullptr, false);
+    assert(s._grayPending);
+  };
+  // Overlay AA over a B/W base: gray where the MSB mask is set.
+  grayPass();
+  expectStrip2677(s, r, fb, base, msb);
+  assert(s._lsb[200] == 0xE0 && s._lsb[201] == 0x03);  // only the strip's pixels cleared
+  // The next strip diffs against the last one.
+  Bytes glass(s._old, s._old + 48000), gray(s._lsb, s._lsb + 48000), next(48000, 0x0F);
+  expectStrip2677(s, r, next, glass, gray);
+  bus.clear();
+  assert(!s.displayRetainedGrayscaleOverlay(bus, nullptr, r.x, r.y, r.w, r.h));  // no restore
+  assert(!s.displayRetainedGrayscaleOverlay(bus, fb.data(), 799, 0, 2, 1));
+  assert(bus.writes.empty());
+  // Any later frame, a new gray pass or deep sleep ends it.
+  s.display(bus, white.data(), nullptr, RefreshMode::Fast, false);
+  assert(!s.displayRetainedGrayscaleOverlay(bus, fb.data(), r.x, r.y, r.w, r.h));
+  grayPass();
+  s.beginGrayscale(bus, base.data(), GrayscaleMode::Overlay, RefreshMode::Fast, false);
+  assert(!s.displayRetainedGrayscaleOverlay(bus, fb.data(), r.x, r.y, r.w, r.h));
+  grayPass();
+  s.beginGrayscale(bus, white.data(), GrayscaleMode::Absolute, RefreshMode::Half, false);
+  assert(!s.displayRetainedGrayscaleOverlay(bus, fb.data(), r.x, r.y, r.w, r.h));
+  s.requestResync(1);
+  grayPass();
+  s.deepSleep(bus);
+  bus.clear();
+  assert(!s.displayRetainedGrayscaleOverlay(bus, fb.data(), r.x, r.y, r.w, r.h));
+  assert(bus.writes.empty());
+  s.begin(bus);
+}
+
+// A strip over a one-pass text AA page: the text pass flags its gray pixels the same way.
+static void expectTextAaStrip2677(Ssd2677Driver& s) {
+  EpdBus bus;
+  Bytes base(48000, 0xFF), lsb(48000, 0), msb(48000, 0), fb(48000, 0x00);
+  base[0] = 0x1F;  // 3 px black
+  lsb[0] = 0x18;   // then 2 px gray, in the base as white
+  msb[0] = 0x08;
+  s.display(bus, base.data(), nullptr, RefreshMode::Full, false);
+  s.setReaderRefresh(true);
+  s.beginGrayscale(bus, base.data(), GrayscaleMode::Overlay, RefreshMode::Fast, false);
+  assert(s._textAa.active());
+  assert(!s.displayRetainedGrayscaleOverlay(bus, fb.data(), 0, 0, 16, 2));  // pass in progress
+  s.copyGrayscaleLsb(bus, lsb.data());
+  s.copyGrayscaleMsb(bus, msb.data());
+  s.displayGray(bus, base.data(), false, nullptr, false);
+  s.setReaderRefresh(false);
+  assert(s._grayPending && s._lsb[0] == 0x18);
+  const Bytes glass(s._old, s._old + 48000), gray(s._lsb, s._lsb + 48000);
+  expectStrip2677(s, {0, 0, 16, 2}, fb, glass, gray);
+  assert(!s._textAa.onPanel());
+}
+
 int main(int argc, char** argv) {
   const char* which = argc > 1 ? argv[1] : "yrd";
   static const uint8_t yrd[10] = {0xCA, 0xFE, 0x00, 0x16, 0x77, 0x02, 0x10, 0x01, 0x00, 0x91};
@@ -620,6 +746,7 @@ int main(int argc, char** argv) {
     assert(lastRegister(bus, 0x00) == 0x27 && lastRegister(bus, 0xE9) == 0x01);
     if (argc > 2 && !strcmp(argv[2], "textaa")) {
       expectOnePassTextAa2677(s);
+      expectTextAaStrip2677(s);
       std::printf("Picco se0400: one-pass text AA passed\n");
       return 0;
     }
@@ -849,6 +976,7 @@ int main(int argc, char** argv) {
       if (w.command == 0x20) assert(w.bytes == Bytes(lut_picco_se0400_full, lut_picco_se0400_full + 535));
     expectNightGray2677(s);
     expectDarkGray2677(s);
+    expectRetainedGrayStrip2677(s);
     std::printf("Picco se0400: probe, init, packing and refresh passed\n");
     return 0;
   }

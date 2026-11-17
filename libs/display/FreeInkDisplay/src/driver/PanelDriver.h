@@ -115,6 +115,7 @@ class PanelDriver {
 
   // Paint a B/W rectangle over the last absolute gray image, or restore it (fb == nullptr).
   // Returns false without painting when no retained image is available. May repaint the full panel.
+  // SSD2677: over an overlay gray pass instead, and no restore.
   virtual bool displayRetainedGrayscaleOverlay(EpdBus& bus, const uint8_t* fb, uint16_t x, uint16_t y,
                                                uint16_t w, uint16_t h) { return false; }
 
